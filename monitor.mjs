@@ -15,14 +15,8 @@ const MAX_PARALLEL_AUDITS = 2;
 // =========================================================
 // Measurement cycle timestamp
 //
-// This is the REAL time when the monitoring cycle begins.
-//
-// Example:
-// Scheduled: 20:15
-// GitHub actually starts audits: 20:16:24
-// measured_at: 20:16:24
-//
-// All 14 audits from the same cycle share this timestamp.
+// Real time when this GitHub monitoring cycle starts.
+// All 14 audits share the same measured_at.
 // =========================================================
 
 const CYCLE_MEASURED_AT =
@@ -43,13 +37,11 @@ function roundNumber(value, decimals = 2) {
     return null;
   }
 
-  const factor =
-    10 ** decimals;
+  const factor = 10 ** decimals;
 
   return (
-    Math.round(
-      Number(value) * factor
-    ) / factor
+    Math.round(Number(value) * factor) /
+    factor
   );
 }
 
@@ -59,31 +51,17 @@ function roundNumber(value, decimals = 2) {
 // =========================================================
 
 if (!process.env.SUPABASE_URL) {
-
-  console.error(
-    "Missing database URL."
-  );
-
+  console.error("Missing database URL.");
   process.exit(1);
 }
-
 
 if (!process.env.SUPABASE_KEY) {
-
-  console.error(
-    "Missing database key."
-  );
-
+  console.error("Missing database key.");
   process.exit(1);
 }
 
-
 if (!process.env.MONITOR_CONFIG) {
-
-  console.error(
-    "Missing monitor configuration."
-  );
-
+  console.error("Missing monitor configuration.");
   process.exit(1);
 }
 
@@ -93,7 +71,6 @@ if (!process.env.MONITOR_CONFIG) {
 // =========================================================
 
 let pages;
-
 
 try {
 
@@ -144,8 +121,8 @@ const supabase =
 // =========================================================
 // Device configurations
 //
-// Lighthouse default configuration = Mobile
-// Desktop uses Lighthouse desktop preset
+// Lighthouse default = Mobile
+// Desktop = Lighthouse desktop preset
 // =========================================================
 
 const devices = [
@@ -213,7 +190,7 @@ for (const page of pages) {
 // =========================================================
 // Execute Lighthouse
 //
-// URLs are intentionally not printed in public logs.
+// URLs are not printed in public logs.
 // =========================================================
 
 function executeLighthouse(
@@ -290,9 +267,7 @@ function executeLighthouse(
           resolve({
 
             exitCode: null,
-
             timedOut: false,
-
             processError: true
 
           });
@@ -310,9 +285,7 @@ function executeLighthouse(
           resolve({
 
             exitCode: code,
-
             timedOut,
-
             processError: false
 
           });
@@ -348,6 +321,10 @@ function buildRecord(
       task.device,
 
     performance_score:
+      null,
+
+    // Main requested KPI
+    page_load_time_ms:
       null,
 
     lcp_ms:
@@ -459,6 +436,13 @@ function buildRecord(
     result.audits ?? {};
 
 
+  // Lighthouse observed navigation metrics
+  const metrics =
+    audits["metrics"]
+      ?.details
+      ?.items?.[0] ?? {};
+
+
 // =========================================================
 // Performance Score
 // =========================================================
@@ -476,6 +460,20 @@ function buildRecord(
           0
         )
       : null;
+
+
+// =========================================================
+// Page Load Time
+//
+// Time until browser "load" event is observed.
+// Main KPI requested for the project.
+// =========================================================
+
+  record.page_load_time_ms =
+    roundNumber(
+      metrics.observedLoad,
+      2
+    );
 
 
 // =========================================================
@@ -603,11 +601,6 @@ function buildRecord(
 
 // =========================================================
 // Failed requests
-//
-// Includes:
-// - unfinished requests
-// - HTTP >= 400
-// - negative status codes / no valid HTTP response
 // =========================================================
 
   record.failed_requests =
@@ -627,11 +620,6 @@ function buildRecord(
           (
             Number.isFinite(status) &&
             status >= 400
-          ) ||
-
-          (
-            Number.isFinite(status) &&
-            status < 0
           )
 
         );
@@ -643,11 +631,8 @@ function buildRecord(
 // =========================================================
 // Slow requests
 //
-// Lighthouse network-requests exposes:
-// networkRequestTime = request start in ms
-// networkEndTime     = request end in ms
-//
-// Slow = request duration >= 3 seconds.
+// network-requests exposes startTime/endTime in ms.
+// A request >= 3 seconds is considered slow.
 // =========================================================
 
   record.slow_requests =
@@ -656,13 +641,13 @@ function buildRecord(
 
         const start =
           Number(
-            request.networkRequestTime
+            request.startTime
           );
 
 
         const end =
           Number(
-            request.networkEndTime
+            request.endTime
           );
 
 
@@ -824,7 +809,11 @@ async function runAudit(
     );
 
 
-  if (fs.existsSync(outputPath)) {
+  if (
+    fs.existsSync(
+      outputPath
+    )
+  ) {
 
     fs.unlinkSync(
       outputPath
@@ -889,7 +878,8 @@ async function worker() {
       result;
 
 
-    // Public log contains no URL.
+    // Generic public log.
+    // No URLs or private page names.
     console.log(
 
       `Audit ${currentIndex + 1}/${tasks.length}: page ${task.page_id} - ${result.device} - ${result.audit_status}`
