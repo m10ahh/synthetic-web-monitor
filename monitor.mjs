@@ -2,12 +2,31 @@ import fs from "fs";
 import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 
+
+// =========================================================
+// Configuration
+// =========================================================
+
 const SLOW_REQUEST_THRESHOLD_MS = 3000;
 const AUDIT_TIMEOUT_MS = 70000;
 const MAX_PARALLEL_AUDITS = 2;
 
-// Same timestamp for every audit in this monitoring cycle
-const CYCLE_MEASURED_AT = new Date().toISOString();
+
+// =========================================================
+// Measurement cycle timestamp
+//
+// This is the REAL time when the monitoring cycle begins.
+//
+// Example:
+// Scheduled: 20:15
+// GitHub actually starts audits: 20:16:24
+// measured_at: 20:16:24
+//
+// All 14 audits from the same cycle share this timestamp.
+// =========================================================
+
+const CYCLE_MEASURED_AT =
+  new Date().toISOString();
 
 
 // =========================================================
@@ -24,11 +43,13 @@ function roundNumber(value, decimals = 2) {
     return null;
   }
 
-  const factor = 10 ** decimals;
+  const factor =
+    10 ** decimals;
 
   return (
-    Math.round(Number(value) * factor) /
-    factor
+    Math.round(
+      Number(value) * factor
+    ) / factor
   );
 }
 
@@ -38,31 +59,48 @@ function roundNumber(value, decimals = 2) {
 // =========================================================
 
 if (!process.env.SUPABASE_URL) {
-  console.error("Missing database URL.");
+
+  console.error(
+    "Missing database URL."
+  );
+
   process.exit(1);
 }
+
 
 if (!process.env.SUPABASE_KEY) {
-  console.error("Missing database key.");
+
+  console.error(
+    "Missing database key."
+  );
+
   process.exit(1);
 }
 
+
 if (!process.env.MONITOR_CONFIG) {
-  console.error("Missing monitor configuration.");
+
+  console.error(
+    "Missing monitor configuration."
+  );
+
   process.exit(1);
 }
 
 
 // =========================================================
-// Read private monitor configuration
+// Read private page configuration
 // =========================================================
 
 let pages;
 
+
 try {
 
   pages =
-    JSON.parse(process.env.MONITOR_CONFIG);
+    JSON.parse(
+      process.env.MONITOR_CONFIG
+    );
 
 } catch {
 
@@ -71,7 +109,6 @@ try {
   );
 
   process.exit(1);
-
 }
 
 
@@ -85,7 +122,6 @@ if (
   );
 
   process.exit(1);
-
 }
 
 
@@ -106,10 +142,10 @@ const supabase =
 
 
 // =========================================================
-// Devices
+// Device configurations
 //
-// Lighthouse default = mobile
-// Desktop uses official desktop preset
+// Lighthouse default configuration = Mobile
+// Desktop uses Lighthouse desktop preset
 // =========================================================
 
 const devices = [
@@ -148,7 +184,6 @@ for (const page of pages) {
     );
 
     process.exit(1);
-
   }
 
 
@@ -178,7 +213,7 @@ for (const page of pages) {
 // =========================================================
 // Execute Lighthouse
 //
-// URLs are never printed in public logs
+// URLs are intentionally not printed in public logs.
 // =========================================================
 
 function executeLighthouse(
@@ -192,11 +227,12 @@ function executeLighthouse(
       const args = [
 
         "--no-install",
+
         "lighthouse",
 
         task.url,
 
-        "--only-categories=performance",
+        "--only-categories=performance,best-practices",
 
         "--output=json",
 
@@ -372,7 +408,6 @@ function buildRecord(
       "AUDIT_TIMEOUT";
 
     return record;
-
   }
 
 
@@ -382,7 +417,6 @@ function buildRecord(
       "PROCESS_ERROR";
 
     return record;
-
   }
 
 
@@ -392,7 +426,6 @@ function buildRecord(
       "NO_RESULT_FILE";
 
     return record;
-
   }
 
 
@@ -419,7 +452,6 @@ function buildRecord(
       "INVALID_RESULT";
 
     return record;
-
   }
 
 
@@ -428,23 +460,27 @@ function buildRecord(
 
 
 // =========================================================
-// Core performance metrics
+// Performance Score
 // =========================================================
 
-  const score =
+  const performanceScore =
     result.categories
       ?.performance
       ?.score;
 
 
   record.performance_score =
-    typeof score === "number"
+    typeof performanceScore === "number"
       ? roundNumber(
-          score * 100,
+          performanceScore * 100,
           0
         )
       : null;
 
+
+// =========================================================
+// Largest Contentful Paint
+// =========================================================
 
   record.lcp_ms =
     roundNumber(
@@ -455,6 +491,10 @@ function buildRecord(
     );
 
 
+// =========================================================
+// First Contentful Paint
+// =========================================================
+
   record.fcp_ms =
     roundNumber(
       audits[
@@ -463,6 +503,10 @@ function buildRecord(
       2
     );
 
+
+// =========================================================
+// Cumulative Layout Shift
+// =========================================================
 
   record.cls =
     roundNumber(
@@ -473,6 +517,10 @@ function buildRecord(
     );
 
 
+// =========================================================
+// Total Blocking Time
+// =========================================================
+
   record.tbt_ms =
     roundNumber(
       audits[
@@ -481,6 +529,10 @@ function buildRecord(
       2
     );
 
+
+// =========================================================
+// Speed Index
+// =========================================================
 
   record.speed_index_ms =
     roundNumber(
@@ -492,7 +544,7 @@ function buildRecord(
 
 
 // =========================================================
-// Network diagnostics
+// Network requests
 // =========================================================
 
   const networkRequests =
@@ -551,6 +603,11 @@ function buildRecord(
 
 // =========================================================
 // Failed requests
+//
+// Includes:
+// - unfinished requests
+// - HTTP >= 400
+// - negative status codes / no valid HTTP response
 // =========================================================
 
   record.failed_requests =
@@ -562,6 +619,7 @@ function buildRecord(
             request.statusCode
           );
 
+
         return (
 
           request.finished === false ||
@@ -569,6 +627,11 @@ function buildRecord(
           (
             Number.isFinite(status) &&
             status >= 400
+          ) ||
+
+          (
+            Number.isFinite(status) &&
+            status < 0
           )
 
         );
@@ -580,8 +643,11 @@ function buildRecord(
 // =========================================================
 // Slow requests
 //
-// Lighthouse network request startTime/endTime
-// are already expressed in milliseconds.
+// Lighthouse network-requests exposes:
+// networkRequestTime = request start in ms
+// networkEndTime     = request end in ms
+//
+// Slow = request duration >= 3 seconds.
 // =========================================================
 
   record.slow_requests =
@@ -590,12 +656,13 @@ function buildRecord(
 
         const start =
           Number(
-            request.startTime
+            request.networkRequestTime
           );
+
 
         const end =
           Number(
-            request.endTime
+            request.networkEndTime
           );
 
 
@@ -605,7 +672,6 @@ function buildRecord(
         ) {
 
           return false;
-
         }
 
 
@@ -623,18 +689,18 @@ function buildRecord(
 
 
 // =========================================================
-// Page transfer size
+// Total transferred page size
 // =========================================================
 
   const totalTransferBytes =
     networkRequests.reduce(
       (
-        sum,
+        total,
         request
       ) => {
 
         return (
-          sum +
+          total +
           (
             Number(
               request.transferSize
@@ -658,10 +724,18 @@ function buildRecord(
 // Browser console errors
 // =========================================================
 
-  record.console_errors =
+  const consoleErrorItems =
     audits[
       "errors-in-console"
-    ]?.details?.items?.length ?? 0;
+    ]?.details?.items;
+
+
+  record.console_errors =
+    Array.isArray(
+      consoleErrorItems
+    )
+      ? consoleErrorItems.length
+      : 0;
 
 
 // =========================================================
@@ -669,7 +743,8 @@ function buildRecord(
 // =========================================================
 
   record.lighthouse_version =
-    result.lighthouseVersion ?? null;
+    result.lighthouseVersion ??
+    null;
 
 
 // =========================================================
@@ -682,6 +757,7 @@ function buildRecord(
 
     record.audit_status =
       "failed";
+
 
     record.error_type =
       String(
@@ -697,6 +773,7 @@ function buildRecord(
     record.audit_status =
       "success";
 
+
     record.error_type =
       null;
 
@@ -706,6 +783,7 @@ function buildRecord(
 
     record.audit_status =
       "failed";
+
 
     record.error_type =
       "LIGHTHOUSE_EXIT_ERROR";
@@ -746,9 +824,7 @@ async function runAudit(
     );
 
 
-  if (
-    fs.existsSync(outputPath)
-  ) {
+  if (fs.existsSync(outputPath)) {
 
     fs.unlinkSync(
       outputPath
@@ -765,7 +841,7 @@ async function runAudit(
 // =========================================================
 // Worker pool
 //
-// Maximum 2 Lighthouse audits simultaneously
+// Maximum 2 Lighthouse audits simultaneously.
 // =========================================================
 
 const results =
@@ -791,12 +867,13 @@ async function worker() {
     ) {
 
       break;
-
     }
 
 
     const task =
-      tasks[currentIndex];
+      tasks[
+        currentIndex
+      ];
 
 
     const result =
@@ -806,12 +883,13 @@ async function worker() {
       );
 
 
-    results[currentIndex] =
+    results[
+      currentIndex
+    ] =
       result;
 
 
-    // Generic public logging only.
-    // No URL or private page name is shown.
+    // Public log contains no URL.
     console.log(
 
       `Audit ${currentIndex + 1}/${tasks.length}: page ${task.page_id} - ${result.device} - ${result.audit_status}`
@@ -824,7 +902,7 @@ async function worker() {
 
 
 // =========================================================
-// Execute worker pool
+// Execute workers
 // =========================================================
 
 const workers =
@@ -909,7 +987,7 @@ console.log(
 
 
 console.log(
-  `Cycle timestamp: ${CYCLE_MEASURED_AT}`
+  `Measurement cycle started at: ${CYCLE_MEASURED_AT}`
 );
 
 
