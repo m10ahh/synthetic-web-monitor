@@ -1,0 +1,40 @@
+name: Web Performance Monitor
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-performance-monitor
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: |
+          npm install --no-save lighthouse @supabase/supabase-js
+
+      - name: Run performance audits
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          MONITOR_CONFIG: ${{ secrets.MONITOR_CONFIG }}
+        run: |
+          node monitor.mjs
