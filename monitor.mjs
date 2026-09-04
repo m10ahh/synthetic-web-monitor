@@ -1,986 +1,460 @@
-import fs from "fs";
-import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
+const execFileAsync = promisify(execFile);
 
-// =========================================================
+// ============================================================
 // Configuration
-// =========================================================
+// ============================================================
 
 const SLOW_REQUEST_THRESHOLD_MS = 3000;
 const AUDIT_TIMEOUT_MS = 70000;
 const MAX_PARALLEL_AUDITS = 2;
 
+const CYCLE_MEASURED_AT = new Date().toISOString();
 
-// =========================================================
-// Measurement cycle timestamp
-//
-// Real time when this GitHub monitoring cycle starts.
-// All 14 audits share the same measured_at.
-// =========================================================
+const {
+  SUPABASE_URL,
+  SUPABASE_KEY,
+  MONITOR_CONFIG
+} = process.env;
 
-const CYCLE_MEASURED_AT =
-  new Date().toISOString();
+if (!SUPABASE_URL || !SUPABASE_KEY || !MONITOR_CONFIG) {
+  throw new Error("Missing required environment variables.");
+}
 
-
-// =========================================================
-// Utility functions
-// =========================================================
-
-function roundNumber(value, decimals = 2) {
-
-  if (
-    value === null ||
-    value === undefined ||
-    !Number.isFinite(Number(value))
-  ) {
-    return null;
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_KEY,
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false
+    }
   }
+);
 
-  const factor = 10 ** decimals;
+// ============================================================
+// Monitor configuration
+// ============================================================
 
-  return (
-    Math.round(Number(value) * factor) /
-    factor
-  );
-}
-
-
-// =========================================================
-// Validate environment variables
-// =========================================================
-
-if (!process.env.SUPABASE_URL) {
-  console.error("Missing database URL.");
-  process.exit(1);
-}
-
-if (!process.env.SUPABASE_KEY) {
-  console.error("Missing database key.");
-  process.exit(1);
-}
-
-if (!process.env.MONITOR_CONFIG) {
-  console.error("Missing monitor configuration.");
-  process.exit(1);
-}
-
-
-// =========================================================
-// Read private page configuration
-// =========================================================
-
-let pages;
+let parsedConfig;
 
 try {
-
-  pages =
-    JSON.parse(
-      process.env.MONITOR_CONFIG
-    );
-
+  parsedConfig = JSON.parse(MONITOR_CONFIG);
 } catch {
-
-  console.error(
-    "Invalid monitor configuration."
-  );
-
-  process.exit(1);
+  throw new Error("MONITOR_CONFIG is not valid JSON.");
 }
 
+const pages = Array.isArray(parsedConfig)
+  ? parsedConfig
+  : parsedConfig.pages;
 
-if (
-  !Array.isArray(pages) ||
-  pages.length === 0
-) {
-
-  console.error(
-    "No pages configured."
-  );
-
-  process.exit(1);
+if (!Array.isArray(pages) || pages.length === 0) {
+  throw new Error("MONITOR_CONFIG does not contain pages.");
 }
-
-
-// =========================================================
-// Supabase connection
-// =========================================================
-
-const supabase =
-  createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_KEY,
-    {
-      auth: {
-        persistSession: false
-      }
-    }
-  );
-
-
-// =========================================================
-// Device configurations
-//
-// Lighthouse default = Mobile
-// Desktop = Lighthouse desktop preset
-// =========================================================
 
 const devices = [
-
   {
     name: "mobile",
     extraArgs: []
   },
-
   {
     name: "desktop",
-    extraArgs: [
-      "--preset=desktop"
-    ]
+    extraArgs: ["--preset=desktop"]
   }
-
 ];
 
+// ============================================================
+// Helpers
+// ============================================================
 
-// =========================================================
-// Build audit tasks
-// =========================================================
+function round(value, decimals = 2) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
 
-const tasks = [];
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
+}
 
+function getHost(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
 
-for (const page of pages) {
+function getRequestDurationMs(request) {
+  if (
+    typeof request.startTime === "number" &&
+    typeof request.endTime === "number"
+  ) {
+    return request.endTime - request.startTime;
+  }
+
+  return null;
+}
+
+function getErrorType(error) {
+  const text = String(
+    error?.message ||
+    error?.stderr ||
+    error ||
+    ""
+  ).toLowerCase();
 
   if (
-    !Number.isInteger(page.page_id) ||
-    typeof page.url !== "string"
+    text.includes("timed out") ||
+    text.includes("timeout") ||
+    error?.killed === true
   ) {
-
-    console.error(
-      "Invalid page configuration."
-    );
-
-    process.exit(1);
+    return "AUDIT_TIMEOUT";
   }
 
-
-  for (const device of devices) {
-
-    tasks.push({
-
-      page_id:
-        page.page_id,
-
-      url:
-        page.url,
-
-      device:
-        device.name,
-
-      extraArgs:
-        device.extraArgs
-
-    });
-
-  }
-
+  return "AUDIT_ERROR";
 }
 
-
-// =========================================================
-// Execute Lighthouse
-//
-// URLs are not printed in public logs.
-// =========================================================
-
-function executeLighthouse(
-  task,
-  outputPath
-) {
-
-  return new Promise(
-    (resolve) => {
-
-      const args = [
-
-        "--no-install",
-
-        "lighthouse",
-
-        task.url,
-
-        "--only-categories=performance,best-practices",
-
-        "--output=json",
-
-        `--output-path=${outputPath}`,
-
-        "--max-wait-for-load=45000",
-
-        "--quiet",
-
-        "--chrome-flags=--headless=new --no-sandbox --disable-dev-shm-usage",
-
-        ...task.extraArgs
-
-      ];
-
-
-      const child =
-        spawn(
-          "npx",
-          args,
-          {
-            stdio: [
-              "ignore",
-              "ignore",
-              "ignore"
-            ]
-          }
-        );
-
-
-      let timedOut = false;
-
-
-      const timer =
-        setTimeout(
-          () => {
-
-            timedOut = true;
-
-            child.kill(
-              "SIGKILL"
-            );
-
-          },
-          AUDIT_TIMEOUT_MS
-        );
-
-
-      child.on(
-        "error",
-        () => {
-
-          clearTimeout(timer);
-
-          resolve({
-
-            exitCode: null,
-            timedOut: false,
-            processError: true
-
-          });
-
-        }
-      );
-
-
-      child.on(
-        "close",
-        (code) => {
-
-          clearTimeout(timer);
-
-          resolve({
-
-            exitCode: code,
-            timedOut,
-            processError: false
-
-          });
-
-        }
-      );
-
-    }
-  );
-
-}
-
-
-// =========================================================
-// Build database record
-// =========================================================
-
-function buildRecord(
-  task,
-  outputPath,
-  processResult
-) {
-
-  const record = {
-
-    measured_at:
-      CYCLE_MEASURED_AT,
-
-    page_id:
-      task.page_id,
-
-    device:
-      task.device,
-
-    performance_score:
-      null,
-
-    // Main requested KPI
-    page_load_time_ms:
-      null,
-
-    lcp_ms:
-      null,
-
-    fcp_ms:
-      null,
-
-    cls:
-      null,
-
-    tbt_ms:
-      null,
-
-    speed_index_ms:
-      null,
-
-    total_requests:
-      null,
-
-    failed_requests:
-      null,
-
-    http_4xx:
-      null,
-
-    http_5xx:
-      null,
-
-    console_errors:
-      null,
-
-    slow_requests:
-      null,
-
-    page_size_kb:
-      null,
-
-    audit_status:
-      "failed",
-
-    error_type:
-      null,
-
-    lighthouse_version:
-      null
-
-  };
-
-
-  // =======================================================
-  // Process-level failures
-  // =======================================================
-
-  if (processResult.timedOut) {
-
-    record.error_type =
-      "AUDIT_TIMEOUT";
-
-    return record;
-  }
-
-
-  if (processResult.processError) {
-
-    record.error_type =
-      "PROCESS_ERROR";
-
-    return record;
-  }
-
-
-  if (!fs.existsSync(outputPath)) {
-
-    record.error_type =
-      "NO_RESULT_FILE";
-
-    return record;
-  }
-
-
-  // =======================================================
-  // Read Lighthouse JSON
-  // =======================================================
-
-  let result;
-
+// ============================================================
+// Lighthouse audit
+// ============================================================
+
+async function runAudit(task) {
+  const fileName =
+    `lighthouse-${task.page_id}-${task.device}-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}.json`;
+
+  const outputPath = path.join(os.tmpdir(), fileName);
 
   try {
+    const lighthouseArgs = [
+      "--no-install",
+      "lighthouse",
+      task.url,
 
-    result =
-      JSON.parse(
-        fs.readFileSync(
-          outputPath,
-          "utf8"
-        )
-      );
+      "--only-categories=performance,best-practices",
 
-  } catch {
+      "--output=json",
+      `--output-path=${outputPath}`,
 
-    record.error_type =
-      "INVALID_RESULT";
+      "--max-wait-for-load=45000",
+      "--quiet",
 
-    return record;
-  }
+      "--chrome-flags=--headless=new --no-sandbox --disable-dev-shm-usage",
 
+      ...task.extraArgs
+    ];
 
-  const audits =
-    result.audits ?? {};
+    await execFileAsync(
+      "npx",
+      lighthouseArgs,
+      {
+        timeout: AUDIT_TIMEOUT_MS,
+        maxBuffer: 10 * 1024 * 1024
+      }
+    );
 
+    const rawReport = await fs.readFile(outputPath, "utf8");
+    const lhr = JSON.parse(rawReport);
 
-  // Lighthouse observed navigation metrics
-  const metrics =
-    audits["metrics"]
-      ?.details
-      ?.items?.[0] ?? {};
+    // --------------------------------------------------------
+    // URL / redirect validation
+    // --------------------------------------------------------
 
+    const requestedUrl = lhr.requestedUrl || task.url;
+    const finalUrl = lhr.finalUrl || requestedUrl;
 
-// =========================================================
-// Performance Score
-// =========================================================
+    const requestedHost = getHost(requestedUrl);
+    const finalHost = getHost(finalUrl);
 
-  const performanceScore =
-    result.categories
-      ?.performance
-      ?.score;
+    /*
+      For this project, was_redirected indicates whether the
+      audit finished on a different hostname.
 
+      Example:
+      www.teapuesto.pe -> mobile.teapuesto.pe
+    */
+    const wasRedirected =
+      requestedHost &&
+      finalHost
+        ? requestedHost !== finalHost
+        : null;
 
-  record.performance_score =
-    typeof performanceScore === "number"
-      ? roundNumber(
-          performanceScore * 100,
-          0
-        )
-      : null;
+    // --------------------------------------------------------
+    // Main metrics
+    // --------------------------------------------------------
 
+    const performanceScore =
+      typeof lhr.categories?.performance?.score === "number"
+        ? Math.round(lhr.categories.performance.score * 100)
+        : null;
 
-// =========================================================
-// Page Load Time
-//
-// Time until browser "load" event is observed.
-// Main KPI requested for the project.
-// =========================================================
+    const metrics =
+      lhr.audits?.["metrics"]?.details?.items?.[0] || {};
 
-  record.page_load_time_ms =
-    roundNumber(
-      metrics.observedLoad,
+    const pageLoadTimeMs =
+      typeof metrics.observedLoad === "number"
+        ? round(metrics.observedLoad, 2)
+        : null;
+
+    const lcpMs = round(
+      lhr.audits?.["largest-contentful-paint"]?.numericValue,
       2
     );
 
-
-// =========================================================
-// Largest Contentful Paint
-// =========================================================
-
-  record.lcp_ms =
-    roundNumber(
-      audits[
-        "largest-contentful-paint"
-      ]?.numericValue,
+    const fcpMs = round(
+      lhr.audits?.["first-contentful-paint"]?.numericValue,
       2
     );
 
-
-// =========================================================
-// First Contentful Paint
-// =========================================================
-
-  record.fcp_ms =
-    roundNumber(
-      audits[
-        "first-contentful-paint"
-      ]?.numericValue,
-      2
-    );
-
-
-// =========================================================
-// Cumulative Layout Shift
-// =========================================================
-
-  record.cls =
-    roundNumber(
-      audits[
-        "cumulative-layout-shift"
-      ]?.numericValue,
+    const cls = round(
+      lhr.audits?.["cumulative-layout-shift"]?.numericValue,
       4
     );
 
-
-// =========================================================
-// Total Blocking Time
-// =========================================================
-
-  record.tbt_ms =
-    roundNumber(
-      audits[
-        "total-blocking-time"
-      ]?.numericValue,
+    const tbtMs = round(
+      lhr.audits?.["total-blocking-time"]?.numericValue,
       2
     );
 
-
-// =========================================================
-// Speed Index
-// =========================================================
-
-  record.speed_index_ms =
-    roundNumber(
-      audits[
-        "speed-index"
-      ]?.numericValue,
+    const speedIndexMs = round(
+      lhr.audits?.["speed-index"]?.numericValue,
       2
     );
 
+    // --------------------------------------------------------
+    // Network requests
+    // --------------------------------------------------------
 
-// =========================================================
-// Network requests
-// =========================================================
+    const networkRequests =
+      lhr.audits?.["network-requests"]?.details?.items || [];
 
-  const networkRequests =
-    audits[
-      "network-requests"
-    ]?.details?.items ?? [];
+    const totalRequests = networkRequests.length;
 
-
-  record.total_requests =
-    networkRequests.length;
-
-
-// =========================================================
-// HTTP 4xx
-// =========================================================
-
-  record.http_4xx =
-    networkRequests.filter(
-      (request) => {
-
-        const status =
-          Number(
-            request.statusCode
-          );
-
-        return (
-          status >= 400 &&
-          status < 500
-        );
-
-      }
+    const http4xx = networkRequests.filter(
+      (request) =>
+        Number(request.statusCode) >= 400 &&
+        Number(request.statusCode) < 500
     ).length;
 
-
-// =========================================================
-// HTTP 5xx
-// =========================================================
-
-  record.http_5xx =
-    networkRequests.filter(
-      (request) => {
-
-        const status =
-          Number(
-            request.statusCode
-          );
-
-        return (
-          status >= 500 &&
-          status < 600
-        );
-
-      }
+    const http5xx = networkRequests.filter(
+      (request) =>
+        Number(request.statusCode) >= 500 &&
+        Number(request.statusCode) < 600
     ).length;
 
+    const failedRequests = networkRequests.filter((request) => {
+      const statusCode = Number(request.statusCode);
 
-// =========================================================
-// Failed requests
-// =========================================================
+      return (
+        request.finished === false ||
+        statusCode >= 400
+      );
+    }).length;
 
-  record.failed_requests =
-    networkRequests.filter(
-      (request) => {
+    const slowRequests = networkRequests.filter((request) => {
+      const durationMs = getRequestDurationMs(request);
 
-        const status =
-          Number(
-            request.statusCode
-          );
+      return (
+        durationMs !== null &&
+        durationMs >= SLOW_REQUEST_THRESHOLD_MS
+      );
+    }).length;
 
-
-        return (
-
-          request.finished === false ||
-
-          (
-            Number.isFinite(status) &&
-            status >= 400
-          )
-
-        );
-
-      }
-    ).length;
-
-
-// =========================================================
-// Slow requests
-//
-// network-requests exposes startTime/endTime in ms.
-// A request >= 3 seconds is considered slow.
-// =========================================================
-
-  record.slow_requests =
-    networkRequests.filter(
-      (request) => {
-
-        const start =
-          Number(
-            request.startTime
-          );
-
-
-        const end =
-          Number(
-            request.endTime
-          );
-
-
-        if (
-          !Number.isFinite(start) ||
-          !Number.isFinite(end)
-        ) {
-
-          return false;
-        }
-
-
-        const durationMs =
-          end - start;
-
-
-        return (
-          durationMs >=
-          SLOW_REQUEST_THRESHOLD_MS
-        );
-
-      }
-    ).length;
-
-
-// =========================================================
-// Total transferred page size
-// =========================================================
-
-  const totalTransferBytes =
-    networkRequests.reduce(
-      (
-        total,
-        request
-      ) => {
-
-        return (
-          total +
-          (
-            Number(
-              request.transferSize
-            ) || 0
-          )
-        );
-
+    const totalTransferSize = networkRequests.reduce(
+      (sum, request) => {
+        const size = Number(request.transferSize);
+        return sum + (Number.isFinite(size) ? size : 0);
       },
       0
     );
 
+    const pageSizeKb = round(totalTransferSize / 1024, 2);
 
-  record.page_size_kb =
-    roundNumber(
-      totalTransferBytes / 1024,
-      2
-    );
+    // --------------------------------------------------------
+    // Console errors
+    // --------------------------------------------------------
 
+    const consoleErrorItems =
+      lhr.audits?.["errors-in-console"]?.details?.items || [];
 
-// =========================================================
-// Browser console errors
-// =========================================================
+    const consoleErrors = consoleErrorItems.length;
 
-  const consoleErrorItems =
-    audits[
-      "errors-in-console"
-    ]?.details?.items;
+    // --------------------------------------------------------
+    // Result
+    // --------------------------------------------------------
 
+    return {
+      measured_at: CYCLE_MEASURED_AT,
+      page_id: task.page_id,
+      device: task.device,
 
-  record.console_errors =
-    Array.isArray(
-      consoleErrorItems
-    )
-      ? consoleErrorItems.length
-      : 0;
+      page_load_time_ms: pageLoadTimeMs,
+      performance_score: performanceScore,
 
+      lcp_ms: lcpMs,
+      fcp_ms: fcpMs,
+      cls,
+      tbt_ms: tbtMs,
+      speed_index_ms: speedIndexMs,
 
-// =========================================================
-// Lighthouse version
-// =========================================================
+      total_requests: totalRequests,
+      failed_requests: failedRequests,
+      http_4xx: http4xx,
+      http_5xx: http5xx,
+      console_errors: consoleErrors,
+      slow_requests: slowRequests,
+      page_size_kb: pageSizeKb,
 
-  record.lighthouse_version =
-    result.lighthouseVersion ??
-    null;
+      lighthouse_version: lhr.lighthouseVersion || null,
 
+      // New redirect fields
+      requested_host: requestedHost,
+      final_host: finalHost,
+      was_redirected: wasRedirected,
 
-// =========================================================
-// Final audit status
-// =========================================================
+      audit_status: "success",
+      error_type: null
+    };
+  } catch (error) {
+    return {
+      measured_at: CYCLE_MEASURED_AT,
+      page_id: task.page_id,
+      device: task.device,
 
-  if (
-    result.runtimeError?.code
-  ) {
+      page_load_time_ms: null,
+      performance_score: null,
 
-    record.audit_status =
-      "failed";
+      lcp_ms: null,
+      fcp_ms: null,
+      cls: null,
+      tbt_ms: null,
+      speed_index_ms: null,
 
+      total_requests: null,
+      failed_requests: null,
+      http_4xx: null,
+      http_5xx: null,
+      console_errors: null,
+      slow_requests: null,
+      page_size_kb: null,
 
-    record.error_type =
-      String(
-        result.runtimeError.code
+      lighthouse_version: null,
+
+      requested_host: getHost(task.url),
+      final_host: null,
+      was_redirected: null,
+
+      audit_status: "failed",
+      error_type: getErrorType(error)
+    };
+  } finally {
+    try {
+      await fs.unlink(outputPath);
+    } catch {
+      // Ignore cleanup errors.
+    }
+  }
+}
+
+// ============================================================
+// Parallel execution
+// ============================================================
+
+async function runWithConcurrency(tasks, limit) {
+  const results = new Array(tasks.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const currentIndex = nextIndex++;
+
+      if (currentIndex >= tasks.length) {
+        break;
+      }
+
+      const task = tasks[currentIndex];
+      const result = await runAudit(task);
+
+      results[currentIndex] = result;
+
+      console.log(
+        `page ${task.page_id} - ${task.device} - ${result.audit_status}`
       );
-
+    }
   }
 
-  else if (
-    processResult.exitCode === 0
-  ) {
-
-    record.audit_status =
-      "success";
-
-
-    record.error_type =
-      null;
-
-  }
-
-  else {
-
-    record.audit_status =
-      "failed";
-
-
-    record.error_type =
-      "LIGHTHOUSE_EXIT_ERROR";
-
-  }
-
-
-  return record;
-
-}
-
-
-// =========================================================
-// Run individual audit
-// =========================================================
-
-async function runAudit(
-  task,
-  index
-) {
-
-  const outputPath =
-    `result-${task.page_id}-${task.device}-${Date.now()}-${index}.json`;
-
-
-  const processResult =
-    await executeLighthouse(
-      task,
-      outputPath
-    );
-
-
-  const record =
-    buildRecord(
-      task,
-      outputPath,
-      processResult
-    );
-
-
-  if (
-    fs.existsSync(
-      outputPath
-    )
-  ) {
-
-    fs.unlinkSync(
-      outputPath
-    );
-
-  }
-
-
-  return record;
-
-}
-
-
-// =========================================================
-// Worker pool
-//
-// Maximum 2 Lighthouse audits simultaneously.
-// =========================================================
-
-const results =
-  new Array(
-    tasks.length
+  const workers = Array.from(
+    {
+      length: Math.min(limit, tasks.length)
+    },
+    () => worker()
   );
 
+  await Promise.all(workers);
 
-let cursor = 0;
+  return results;
+}
 
+// ============================================================
+// Main
+// ============================================================
 
-async function worker() {
+async function main() {
+  const tasks = [];
 
-  while (true) {
-
-    const currentIndex =
-      cursor++;
-
-
-    if (
-      currentIndex >=
-      tasks.length
-    ) {
-
-      break;
+  for (const page of pages) {
+    if (!page.page_id || !page.url) {
+      continue;
     }
 
-
-    const task =
-      tasks[
-        currentIndex
-      ];
-
-
-    const result =
-      await runAudit(
-        task,
-        currentIndex
-      );
-
-
-    results[
-      currentIndex
-    ] =
-      result;
-
-
-    // Generic public log.
-    // No URLs or private page names.
-    console.log(
-
-      `Audit ${currentIndex + 1}/${tasks.length}: page ${task.page_id} - ${result.device} - ${result.audit_status}`
-
-    );
-
+    for (const device of devices) {
+      tasks.push({
+        page_id: page.page_id,
+        url: page.url,
+        device: device.name,
+        extraArgs: device.extraArgs
+      });
+    }
   }
 
-}
+  if (tasks.length === 0) {
+    throw new Error("No valid monitoring tasks were found.");
+  }
 
+  console.log(`Starting ${tasks.length} audits.`);
 
-// =========================================================
-// Execute workers
-// =========================================================
-
-const workers =
-  Array.from(
-
-    {
-      length:
-        Math.min(
-          MAX_PARALLEL_AUDITS,
-          tasks.length
-        )
-    },
-
-    () => worker()
-
+  const results = await runWithConcurrency(
+    tasks,
+    MAX_PARALLEL_AUDITS
   );
 
+  const { error } = await supabase
+    .from("web_performance")
+    .insert(results);
 
-await Promise.all(
-  workers
-);
+  if (error) {
+    throw error;
+  }
 
-
-// =========================================================
-// Insert complete monitoring cycle into Supabase
-// =========================================================
-
-const validResults =
-  results.filter(
-    Boolean
-  );
-
-
-const { error } =
-  await supabase
-    .from(
-      "web_performance"
-    )
-    .insert(
-      validResults
-    );
-
-
-if (error) {
-
-  console.error(
-
-    `Database insert failed (${error.code ?? "unknown"}).`
-
-  );
-
-  process.exit(1);
-
-}
-
-
-// =========================================================
-// Final summary
-// =========================================================
-
-const successCount =
-  validResults.filter(
-    (row) =>
-      row.audit_status ===
-      "success"
+  const successful = results.filter(
+    (result) => result.audit_status === "success"
   ).length;
 
+  const failed = results.length - successful;
 
-const failureCount =
-  validResults.length -
-  successCount;
+  console.log(
+    `Completed: ${successful} success, ${failed} failed.`
+  );
+}
 
-
-console.log(
-  `Completed ${validResults.length} audits.`
-);
-
-
-console.log(
-  `Successful: ${successCount}. Failed: ${failureCount}.`
-);
-
-
-console.log(
-  `Measurement cycle started at: ${CYCLE_MEASURED_AT}`
-);
-
-
-console.log(
-  "Results stored successfully."
-);
+main().catch((error) => {
+  console.error("Monitoring cycle failed.");
+  process.exit(1);
+});
