@@ -90,6 +90,16 @@ function getHost(url) {
   }
 }
 
+function getPath(url) {
+  try {
+    const parsedUrl = new URL(url);
+
+    return `${parsedUrl.pathname}${parsedUrl.search}`;
+  } catch {
+    return null;
+  }
+}
+
 function getRequestDurationMs(request) {
   if (
     typeof request.startTime === "number" &&
@@ -173,13 +183,9 @@ async function runAudit(task) {
     const requestedHost = getHost(requestedUrl);
     const finalHost = getHost(finalUrl);
 
-    /*
-      For this project, was_redirected indicates whether the
-      audit finished on a different hostname.
+    // NEW: final route reached by Lighthouse
+    const finalPath = getPath(finalUrl);
 
-      Example:
-      www.teapuesto.pe -> mobile.teapuesto.pe
-    */
     const wasRedirected =
       requestedHost &&
       finalHost
@@ -314,9 +320,10 @@ async function runAudit(task) {
 
       lighthouse_version: lhr.lighthouseVersion || null,
 
-      // New redirect fields
+      // URL validation
       requested_host: requestedHost,
       final_host: finalHost,
+      final_path: finalPath,
       was_redirected: wasRedirected,
 
       audit_status: "success",
@@ -349,6 +356,7 @@ async function runAudit(task) {
 
       requested_host: getHost(task.url),
       final_host: null,
+      final_path: null,
       was_redirected: null,
 
       audit_status: "failed",
