@@ -12,6 +12,7 @@ const execFileAsync = promisify(execFile);
 // ============================================================
 
 const SLOW_REQUEST_THRESHOLD_MS = 3000;
+const LIGHTHOUSE_LOAD_WAIT_MS = 45000;
 const AUDIT_TIMEOUT_MS = 70000;
 const MAX_PARALLEL_AUDITS = 2;
 
@@ -93,7 +94,6 @@ function getHost(url) {
 function getPath(url) {
   try {
     const parsedUrl = new URL(url);
-
     return `${parsedUrl.pathname}${parsedUrl.search}`;
   } catch {
     return null;
@@ -111,23 +111,51 @@ function getRequestDurationMs(request) {
   return null;
 }
 
-function getErrorType(error) {
-  const text = String(
-    error?.message ||
+function getErrorText(error) {
+  return String(
     error?.stderr ||
+    error?.message ||
     error ||
     ""
   ).toLowerCase();
+}
+
+function getTimeoutSource(error) {
+  const text = getErrorText(error);
+
+  // Node/execFile stopped Lighthouse because the complete
+  // audit exceeded our 70-second process limit.
+  if (
+    error?.killed === true ||
+    error?.signal === "SIGTERM"
+  ) {
+    return "PROCESS_TIMEOUT_70S";
+  }
+
+  // Lighthouse/navigation-specific timeout indications.
+  if (
+    text.includes("page load") ||
+    text.includes("waiting for page") ||
+    text.includes("navigation timeout") ||
+    text.includes("max-wait-for-load")
+  ) {
+    return "LIGHTHOUSE_LOAD_TIMEOUT_45S";
+  }
 
   if (
     text.includes("timed out") ||
-    text.includes("timeout") ||
-    error?.killed === true
+    text.includes("timeout")
   ) {
-    return "AUDIT_TIMEOUT";
+    return "LIGHTHOUSE_TIMEOUT";
   }
 
-  return "AUDIT_ERROR";
+  return null;
+}
+
+function getErrorType(error) {
+  return getTimeoutSource(error)
+    ? "AUDIT_TIMEOUT"
+    : "AUDIT_ERROR";
 }
 
 // ============================================================
@@ -135,6 +163,8 @@ function getErrorType(error) {
 // ============================================================
 
 async function runAudit(task) {
+  const auditStartedAt = Date.now();
+
   const fileName =
     `lighthouse-${task.page_id}-${task.device}-${Date.now()}-${Math.random()
       .toString(36)
@@ -153,7 +183,7 @@ async function runAudit(task) {
       "--output=json",
       `--output-path=${outputPath}`,
 
-      "--max-wait-for-load=45000",
+      `--max-wait-for-load=${LIGHTHOUSE_LOAD_WAIT_MS}`,
       "--quiet",
 
       "--chrome-flags=--headless=new --no-sandbox --disable-dev-shm-usage",
@@ -182,8 +212,6 @@ async function runAudit(task) {
 
     const requestedHost = getHost(requestedUrl);
     const finalHost = getHost(finalUrl);
-
-    // NEW: final route reached by Lighthouse
     const finalPath = getPath(finalUrl);
 
     const wasRedirected =
@@ -293,6 +321,12 @@ async function runAudit(task) {
     const consoleErrors = consoleErrorItems.length;
 
     // --------------------------------------------------------
+    // Audit diagnostics
+    // --------------------------------------------------------
+
+    const auditDurationMs = Date.now() - auditStartedAt;
+
+    // --------------------------------------------------------
     // Result
     // --------------------------------------------------------
 
@@ -320,16 +354,22 @@ async function runAudit(task) {
 
       lighthouse_version: lhr.lighthouseVersion || null,
 
-      // URL validation
       requested_host: requestedHost,
       final_host: finalHost,
       final_path: finalPath,
       was_redirected: wasRedirected,
 
+      // New diagnostic fields
+      audit_duration_ms: auditDurationMs,
+      timeout_source: null,
+
       audit_status: "success",
       error_type: null
     };
   } catch (error) {
+    const auditDurationMs = Date.now() - auditStartedAt;
+    const timeoutSource = getTimeoutSource(error);
+
     return {
       measured_at: CYCLE_MEASURED_AT,
       page_id: task.page_id,
@@ -358,6 +398,10 @@ async function runAudit(task) {
       final_host: null,
       final_path: null,
       was_redirected: null,
+
+      // New diagnostic fields
+      audit_duration_ms: auditDurationMs,
+      timeout_source: timeoutSource,
 
       audit_status: "failed",
       error_type: getErrorType(error)
