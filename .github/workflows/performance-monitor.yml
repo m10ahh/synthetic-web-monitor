@@ -26,7 +26,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm install --no-save lighthouse @supabase/supabase-js
+          npm install --no-save lighthouse @supabase/supabase-js@2.115.0
 
       - name: Run performance audits
         env:
